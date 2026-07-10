@@ -1,0 +1,440 @@
+import originpro as op
+import pandas as pd
+import argparse
+from pathlib import Path
+
+
+project_path = r"F:\code\mtmh\mhmttest\oritest.opju"
+source_sheet = "MHipop"
+target_sheet = "kutcxz"
+result_sheet = "MSKU"
+
+# These four values are intended to come from the main GUI later.
+left_common_value = 0.333
+right_common_value = 0.333
+left_value = 0.12
+right_value = 0.48
+
+density = 7.35
+scale_factor = density * 1000 / 10000 / 79.57747
+truncate_target = 2.0
+truncate_tolerance = 0.02
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--project", dest="project_path")
+    parser.add_argument("--ip-target-nd", type=float, dest="left_common_value")
+    parser.add_argument("--op-target-nd", type=float, dest="right_common_value")
+    parser.add_argument("--ip-real-nd", type=float, dest="left_value")
+    parser.add_argument("--op-real-nd", type=float, dest="right_value")
+    parser.add_argument("--truncate-target", type=float, dest="truncate_target")
+    parser.add_argument("--density", type=float, dest="density")
+    return parser.parse_args()
+
+
+def get_label(wks, col, kind):
+    try:
+        return wks.get_label(col, kind)
+    except Exception:
+        return ""
+
+
+def copy_column_labels(src, dst, src_col, dst_col):
+    for kind in ("L", "U", "C"):
+        value = get_label(src, src_col, kind)
+        if value:
+            dst.set_label(dst_col, value, kind)
+
+
+def destroy_graph(name):
+    graph = op.find_graph(name)
+    if graph:
+        graph.destroy()
+
+
+def format_graph_layer(gl):
+    gl.lt_exec(
+        "layer.x.showAxes=3;"
+        "layer.y.showAxes=3;"
+        "layer.x2.showAxes=3;"
+        "layer.y2.showAxes=3;"
+        "layer.x.ticks=5;"
+        "layer.y.ticks=5;"
+        "layer.x2.ticks=5;"
+        "layer.y2.ticks=5;"
+        "layer.x.thickness=3;"
+        "layer.y.thickness=3;"
+        "layer.x2.thickness=3;"
+        "layer.y2.thickness=3;"
+        "layer.frame.width=3;"
+    )
+
+
+def plot_xy(graph_name, wks, x_col, y_col):
+    destroy_graph(graph_name)
+    gp = op.new_graph(lname=graph_name, template="Scatter")
+    gl = gp[0]
+    plot = gl.add_plot(wks, coly=y_col, colx=x_col)
+    plot.lt = 200
+    gl.rescale()
+    format_graph_layer(gl)
+
+
+def save_project(close_origin=True):
+    op.lt_exec("system.project.backup=0;system.project.autosaveon=0;")
+    save_path = str(Path(project_path))
+    if not op.save(save_path):
+        raise Exception(f"项目保存失败，请确认文件没有被占用，并且当前账号有写入权限：{save_path}")
+    if close_origin:
+        op.exit()
+
+
+def to_numeric_series(values):
+    return pd.to_numeric(pd.Series(values), errors="coerce")
+
+
+def is_empty_column(values):
+    return to_numeric_series(values).dropna().empty
+
+
+def is_xy_pair(src, x_col, y_col):
+    x_long = get_label(src, x_col, "L").strip().lower()
+    y_long = get_label(src, y_col, "L").strip().lower()
+    return x_long == "h" and y_long == "m"
+
+
+def find_xy_pairs(src, col_count):
+    pairs = []
+    col = 0
+
+    while col + 1 < col_count:
+        if is_xy_pair(src, col, col + 1):
+            pairs.append((col, col + 1))
+            col += 2
+        else:
+            col += 1
+
+    return pairs
+
+
+def find_separator_column(columns, pairs):
+    for col, values in enumerate(columns):
+        if not is_empty_column(values):
+            continue
+
+        has_left_pair = any(y_col < col for _, y_col in pairs)
+        has_right_pair = any(x_col > col for x_col, _ in pairs)
+        if has_left_pair and has_right_pair:
+            return col
+
+    return None
+
+
+def recalculate_x_column(x_values, y_values, common_value, correction_value):
+    x_numeric = to_numeric_series(x_values)
+    y_numeric = to_numeric_series(y_values)
+    output = []
+
+    for original_x, x_number, y_number in zip(x_values, x_numeric, y_numeric):
+        if pd.isna(x_number) or pd.isna(y_number):
+            output.append(original_x)
+        else:
+            output.append(
+                (float(x_number) + float(y_number) * (common_value - correction_value) * scale_factor) / 1
+            )
+
+    return output
+
+
+def first_hit_position(values, target=None, tol=None):
+    if target is None:
+        target = truncate_target
+    if tol is None:
+        tol = truncate_tolerance
+    numeric = to_numeric_series(values)
+    hits = numeric[numeric.between(target - tol, target + tol)]
+    if hits.empty:
+        return None
+    return int(hits.index[0])
+
+
+def last_numeric_value(values):
+    numeric = to_numeric_series(values).dropna()
+    if numeric.empty:
+        return None
+    return float(numeric.iloc[-1])
+
+
+def last_numeric_index(values):
+    numeric = to_numeric_series(values)
+    valid = numeric.dropna()
+    if valid.empty:
+        return None
+    return int(valid.index[-1])
+
+
+def truncate_xy(x_values, y_values):
+    stop = first_hit_position(x_values)
+    if stop is None:
+        return x_values, y_values, None
+    return x_values[: stop + 1], y_values[: stop + 1], stop
+
+
+def scale_numeric_values(values, factor):
+    numeric = to_numeric_series(values)
+    scaled = []
+
+    for original, number in zip(values, numeric):
+        if pd.isna(number):
+            scaled.append(original)
+        else:
+            scaled.append(float(number) * factor)
+
+    return scaled
+
+
+def align_right_side_x_endpoints(columns, left_pairs, right_pairs):
+    aligned = 0
+
+    for left_pair, right_pair in zip(left_pairs, right_pairs):
+        left_x_col = left_pair[0]
+        right_x_col = right_pair[0]
+        left_last = last_numeric_value(columns[left_x_col])
+        right_last_index = last_numeric_index(columns[right_x_col])
+
+        if left_last is None or right_last_index is None:
+            continue
+
+        columns[right_x_col][right_last_index] = left_last
+        aligned += 1
+
+    return aligned
+
+
+def scale_right_side_y_columns(columns, left_pairs, right_pairs):
+    if not left_pairs or not right_pairs:
+        raise Exception("MHipop 表左右两侧没有找到成对的 H/M 数据列。请先确认 MH 分割结果正常。")
+
+    factors = []
+    for left_pair, right_pair in zip(left_pairs, right_pairs):
+        left_y_col = left_pair[1]
+        right_y_col = right_pair[1]
+        left_y = last_numeric_value(columns[left_y_col])
+        right_y = last_numeric_value(columns[right_y_col])
+
+        if left_y is None or right_y is None:
+            factors.append(None)
+            continue
+        if right_y == 0:
+            raise Exception(f"右侧第 {right_y_col + 1} 列最后一个 M 值是 0，无法计算缩放比例。")
+
+        factor = left_y / right_y
+        columns[right_y_col] = scale_numeric_values(columns[right_y_col], factor)
+        factors.append(factor)
+
+    scaled_count = sum(factor is not None for factor in factors)
+    first_factor = factors[0] if factors else None
+    first_left_y = last_numeric_value(columns[left_pairs[0][1]])
+    first_right_y_after = last_numeric_value(columns[right_pairs[0][1]])
+    return factors, scaled_count, first_factor, first_left_y, first_right_y_after
+
+
+def integrate_to_x_axis(x_values, y_values):
+    data = pd.DataFrame(
+        {
+            "x": to_numeric_series(x_values),
+            "y": to_numeric_series(y_values),
+        }
+    ).dropna(subset=["x", "y"])
+
+    if len(data) < 2:
+        return None
+
+    x = data["x"].tolist()
+    y = data["y"].tolist()
+    area = 0.0
+
+    for i in range(1, len(data)):
+        area += 0.5 * (y[i - 1] + y[i]) * (x[i] - x[i - 1])
+
+    return area
+
+
+def comment_to_temperature(comment):
+    import re
+
+    match = re.search(r"[-+]?\d+(?:\.\d+)?", str(comment))
+    if match:
+        value = float(match.group(0))
+        if value.is_integer():
+            return int(value)
+        return value
+    return None
+
+
+def get_or_create_sheet(name):
+    wks = op.find_sheet("w", name)
+    if wks:
+        return wks
+    return op.new_sheet("w", lname=name)
+
+
+def write_integrals_to_msku(left_pairs, right_pairs, columns, labels_src):
+    temps = []
+    left_areas = []
+    right_areas = []
+    diffs = []
+
+    for left_pair, right_pair in zip(left_pairs, right_pairs):
+        left_x_col, left_y_col = left_pair
+        right_x_col, right_y_col = right_pair
+
+        left_area = integrate_to_x_axis(columns[left_x_col], columns[left_y_col])
+        right_area = integrate_to_x_axis(columns[right_x_col], columns[right_y_col])
+
+        temps.append(comment_to_temperature(get_label(labels_src, left_x_col, "C")))
+        left_areas.append(left_area)
+        right_areas.append(right_area)
+        diffs.append(None if left_area is None or right_area is None else left_area - right_area)
+
+    wks = get_or_create_sheet(result_sheet)
+    wks._check_add_cols(13)
+
+    # Columns 10-13 in Origin's 1-based numbering are indexes 9-12.
+    wks.from_list(9, temps)
+    wks.from_list(10, left_areas)
+    wks.from_list(11, right_areas)
+    wks.from_list(12, diffs)
+
+    wks.set_label(9, "T", "L")
+    wks.set_label(10, "LeftArea", "L")
+    wks.set_label(11, "RightArea", "L")
+    wks.set_label(12, "ku", "L")
+    wks.set_label(9, "K", "U")
+    wks.set_label(12, "emu T/g", "U")
+    wks.set_label(9, f"{target_sheet} left temperature", "C")
+    wks.set_label(10, f"{target_sheet} left x/y area", "C")
+    wks.set_label(11, f"{target_sheet} right x/y area", "C")
+    wks.set_label(12, "Ku", "C")
+
+    plot_xy("ku", wks, 9, 12)
+
+    return len(temps)
+
+
+def main(use_cli=True, close_origin=True):
+    if use_cli:
+        args = parse_args()
+        for name in (
+            "project_path",
+            "left_common_value",
+            "right_common_value",
+            "left_value",
+            "right_value",
+            "truncate_target",
+            "density",
+        ):
+            value = getattr(args, name)
+            if value is not None:
+                globals()[name] = value
+
+    globals()["scale_factor"] = density * 1000 / 10000 / 79.57747
+
+    op.set_show(True)
+    op.open(project_path)
+
+    src = op.find_sheet("w", source_sheet)
+    if src is None:
+        raise Exception(f"项目里找不到 {source_sheet} 表。请先运行 mtmh 生成 MHipop。")
+
+    _, col_count = src.shape
+    pairs = find_xy_pairs(src, col_count)
+    if not pairs:
+        raise Exception(f"{source_sheet} 表里没有找到相邻的 H/M 数据列。请检查 MH 分割结果。")
+
+    columns = [src.to_list(col) for col in range(col_count)]
+    separator = find_separator_column(columns, pairs)
+    if separator is None:
+        raise Exception("没有找到分隔 ip/op 数据的空列。请确认 MHipop 表中 ip 和 op 数据中间有空列。")
+
+    left_pairs = [(x_col, y_col) for x_col, y_col in pairs if y_col < separator]
+    right_pairs = [(x_col, y_col) for x_col, y_col in pairs if x_col > separator]
+
+    for x_col, y_col in left_pairs:
+        columns[x_col] = recalculate_x_column(
+            columns[x_col],
+            columns[y_col],
+            left_common_value,
+            left_value,
+        )
+
+    for x_col, y_col in right_pairs:
+        columns[x_col] = recalculate_x_column(
+            columns[x_col],
+            columns[y_col],
+            right_common_value,
+            right_value,
+        )
+
+    hit_count = 0
+    missed = []
+    for pair_index, (x_col, y_col) in enumerate(pairs, start=1):
+        x_cut, y_cut, stop = truncate_xy(columns[x_col], columns[y_col])
+        columns[x_col] = x_cut
+        columns[y_col] = y_cut
+
+        if stop is None:
+            missed.append(pair_index)
+        else:
+            hit_count += 1
+
+    aligned_x_count = align_right_side_x_endpoints(columns, left_pairs, right_pairs)
+    factors, scaled_count, first_factor, first_left_y, first_right_y_after = scale_right_side_y_columns(
+        columns,
+        left_pairs,
+        right_pairs,
+    )
+
+    old = op.find_sheet("w", target_sheet)
+    if old:
+        old.destroy()
+
+    dst = op.new_sheet("w", lname=target_sheet)
+    dst._check_add_cols(col_count)
+
+    for col, values in enumerate(columns):
+        dst.from_list(col, values)
+        copy_column_labels(src, dst, col, col)
+
+    for x_col, y_col in pairs:
+        dst.cols_axis("xy", x_col, y_col)
+
+    integral_count = write_integrals_to_msku(left_pairs, right_pairs, columns, dst)
+
+    save_project(close_origin=close_origin)
+
+    print("Done")
+    print(f"Copied {source_sheet} to {target_sheet} with physical column positions preserved.")
+    print(f"Separator column index: {separator}")
+    print(f"Left-side x columns recalculated: {len(left_pairs)}")
+    print(f"Right-side x columns recalculated: {len(right_pairs)}")
+    print(f"Pairs truncated where x reached {truncate_target}+/-{truncate_tolerance}: {hit_count}")
+    print(f"Right-side x endpoints aligned: {aligned_x_count}")
+    print(f"Scale factors applied to right-side y columns: {factors}")
+    print(f"First scale factor: {first_factor}")
+    print(f"First left y last value after scaling: {first_left_y}")
+    print(f"First right y last value after scaling: {first_right_y_after}")
+    print(f"Right-side y columns scaled: {scaled_count}")
+    print(f"Integral rows written to {result_sheet} columns 10-13: {integral_count}")
+    if missed:
+        print("Pairs not truncated:", ", ".join(map(str, missed)))
+    print(
+        "left_common_value="
+        f"{left_common_value}, right_common_value={right_common_value}, "
+        f"left_value={left_value}, right_value={right_value}"
+    )
+
+
+if __name__ == "__main__":
+    main()

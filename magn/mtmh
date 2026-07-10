@@ -1,0 +1,355 @@
+import originpro as op
+import pandas as pd
+import argparse
+from pathlib import Path
+
+
+project_path = r"C:\Users\理塘丁真\Desktop\新建文件夹 (2)\zld.opju"
+source_sheet = "Book1"
+min_mh_points = 10
+mh_temp_step = 2
+mt_field_step = 0.5
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--project", dest="project_path")
+    parser.add_argument("--source-sheet", dest="source_sheet")
+    return parser.parse_args()
+
+
+def prepare_source_data(df):
+    return df.copy()
+
+
+def destroy_graph(name):
+    graph = op.find_graph(name)
+    if graph:
+        graph.destroy()
+
+
+def format_graph_layer(gl):
+    gl.lt_exec(
+        "layer.x.showAxes=3;"
+        "layer.y.showAxes=3;"
+        "layer.x2.showAxes=3;"
+        "layer.y2.showAxes=3;"
+        "layer.x.ticks=5;"
+        "layer.y.ticks=5;"
+        "layer.x2.ticks=5;"
+        "layer.y2.ticks=5;"
+        "layer.x.thickness=3;"
+        "layer.y.thickness=3;"
+        "layer.x2.thickness=3;"
+        "layer.y2.thickness=3;"
+        "layer.frame.width=3;"
+    )
+
+
+def split_mt_mh_rows(temp, field, moment, max_dh=mt_field_step, min_points=min_mh_points):
+    data = pd.DataFrame(
+        {
+            "T": pd.to_numeric(temp, errors="coerce"),
+            "H": pd.to_numeric(field, errors="coerce"),
+            "M": pd.to_numeric(moment, errors="coerce"),
+        }
+    ).dropna(subset=["T", "H", "M"])
+
+    if data.empty:
+        return data.copy(), data.copy()
+
+    h = data["H"].to_numpy()
+    mt_mask = [False] * len(data)
+    start = 0
+
+    for i in range(1, len(h)):
+        if abs(h[i] - h[i - 1]) >= max_dh:
+            if i - start >= min_points:
+                for j in range(start, i):
+                    mt_mask[j] = True
+            start = i
+
+    if len(h) - start >= min_points:
+        for j in range(start, len(h)):
+            mt_mask[j] = True
+
+    mh_mask = [not value for value in mt_mask]
+    mt_data = data.loc[mt_mask].reset_index(drop=True)
+    mh_data = data.loc[mh_mask].reset_index(drop=True)
+    return mt_data, mh_data
+
+
+def plot_pairs(name, wks, pairs):
+    if not pairs:
+        return
+
+    destroy_graph(name)
+    gp = op.new_graph(lname=name, template="Scatter")
+    gl = gp[0]
+
+    plots = []
+    for x_col, y_col in pairs:
+        plots.append(gl.add_plot(wks, coly=y_col, colx=x_col))
+
+    for plot in plots:
+        plot.lt = 200
+
+    if len(plots) > 1:
+        gl.group()
+    gl.rescale()
+    format_graph_layer(gl)
+
+
+def save_project(close_origin=True):
+    op.lt_exec("system.project.backup=0;system.project.autosaveon=0;")
+    save_path = str(Path(project_path))
+    if not op.save(save_path):
+        raise Exception(f"项目保存失败，请确认文件没有被占用，并且当前账号有写入权限：{save_path}")
+    if close_origin:
+        op.exit()
+
+
+def split_mt(temp, moment):
+    temp = pd.to_numeric(temp, errors="coerce").dropna().to_numpy()
+    moment = pd.to_numeric(moment, errors="coerce").dropna().to_numpy()
+
+    n = min(len(temp), len(moment))
+    temp = temp[:n]
+    moment = moment[:n]
+
+    if n == 0:
+        return pd.DataFrame(
+            {
+                "cool_T": pd.Series(dtype=float),
+                "cool_M": pd.Series(dtype=float),
+                "warm_T": pd.Series(dtype=float),
+                "warm_M": pd.Series(dtype=float),
+            }
+        )
+
+    peak = temp.argmax()
+
+    warm_T = temp[: peak + 1]
+    warm_M = moment[: peak + 1]
+    cool_T = temp[peak:]
+    cool_M = moment[peak:]
+
+    def continuous_filter(tarr, marr):
+        if len(tarr) == 0:
+            return [], []
+
+        new_t = [tarr[0]]
+        new_m = [marr[0]]
+
+        for i in range(1, len(tarr)):
+            dt = abs(tarr[i] - tarr[i - 1])
+            if 0.01 < dt < 5:
+                new_t.append(tarr[i])
+                new_m.append(marr[i])
+
+        return new_t, new_m
+
+    warm_T, warm_M = continuous_filter(warm_T, warm_M)
+    cool_T, cool_M = continuous_filter(cool_T, cool_M)
+
+    return pd.DataFrame(
+        {
+            "cool_T": pd.Series(cool_T),
+            "cool_M": pd.Series(cool_M),
+            "warm_T": pd.Series(warm_T),
+            "warm_M": pd.Series(warm_M),
+        }
+    )
+
+
+def run_mt(ip_mt_data, op_mt_data):
+    ip_df = split_mt(ip_mt_data["T"], ip_mt_data["M"])
+    op_df = split_mt(op_mt_data["T"], op_mt_data["M"])
+    mt_parts = [
+        ip_df[["cool_T", "cool_M"]],
+        ip_df[["warm_T", "warm_M"]],
+        op_df[["cool_T", "cool_M"]],
+        op_df[["warm_T", "warm_M"]],
+    ]
+
+    for part in mt_parts:
+        if part.iloc[:, 0].dropna().shape[0] < 2 or part.iloc[:, 1].dropna().shape[0] < 2:
+            part.iloc[:, 0] = float("nan")
+            part.iloc[:, 1] = float("nan")
+
+    result = pd.concat(
+        mt_parts,
+        axis=1,
+    )
+
+    old = op.find_sheet("w", "MT")
+    if old:
+        old.destroy()
+
+    mt = op.new_sheet("w", lname="MT")
+    mt.from_df(result)
+    mt.cols_axis("xyxyxyxy", 0, 7, repeat=False)
+
+    longnames = ["T", "M", "T", "M", "T", "M", "T", "M"]
+    comments = [
+        "ipcool",
+        "ipcool",
+        "ipwarm",
+        "ipwarm",
+        "opcool",
+        "opcool",
+        "opwarm",
+        "opwarm",
+    ]
+
+    for i in range(8):
+        mt.set_label(i, longnames[i], "L")
+        mt.set_label(i, "K" if i % 2 == 0 else "emu/g", "U")
+        mt.set_label(i, comments[i], "C")
+
+    destroy_graph("MT")
+    gp = op.new_graph(lname="MT", template="Scatter")
+    gl = gp[0]
+
+    plots = []
+    for x_col, y_col in ((0, 1), (2, 3), (4, 5), (6, 7)):
+        pair = result.iloc[:, [x_col, y_col]].dropna()
+        if len(pair) >= 2:
+            plots.append(gl.add_plot(mt, coly=y_col, colx=x_col))
+
+    for plot in plots:
+        plot.lt = 200
+
+    if len(plots) > 1:
+        gl.group()
+    gl.rescale()
+    format_graph_layer(gl)
+
+
+def split_mh(temp, field, moment, min_points=min_mh_points, max_dt=mh_temp_step):
+    data = pd.DataFrame(
+        {
+            "T": pd.to_numeric(temp, errors="coerce"),
+            "H": pd.to_numeric(field, errors="coerce"),
+            "M": pd.to_numeric(moment, errors="coerce"),
+        }
+    ).dropna(subset=["T", "H", "M"])
+
+    if data.empty:
+        return []
+
+    t = data["T"].to_numpy()
+    h = data["H"].to_numpy()
+    m = data["M"].to_numpy()
+
+    segments = []
+    start = 0
+
+    for i in range(1, len(t)):
+        if abs(t[i] - t[i - 1]) >= max_dt:
+            if i - start >= min_points:
+                segments.append(make_mh_segment(t[start:i], h[start:i], m[start:i]))
+            start = i
+
+    if len(t) - start >= min_points:
+        segments.append(make_mh_segment(t[start:], h[start:], m[start:]))
+
+    return segments
+
+
+def make_mh_segment(temp, field, moment):
+    return {
+        "T": temp,
+        "H": field,
+        "M": moment,
+        "label": str(int(round(float(temp[0])))),
+    }
+
+
+def write_mh_segments(wks, segments, start_col, suffix):
+    col = start_col
+    pair_cols = []
+
+    for seg in segments:
+        if len(seg["H"]) < min_mh_points or len(seg["H"]) < 2 or len(seg["M"]) < 2:
+            continue
+
+        wks._check_add_cols(col + 2)
+
+        wks.set_label(col, "H", "L")
+        wks.set_label(col + 1, "M", "L")
+        wks.set_label(col, "T", "U")
+        wks.set_label(col + 1, "emu/g", "U")
+
+        comment = f"{seg['label']}{suffix}"
+        wks.set_label(col, comment, "C")
+        wks.set_label(col + 1, comment, "C")
+
+        wks.from_list(col, pd.Series(seg["H"]) / 10000)
+        wks.from_list(col + 1, seg["M"])
+        wks.cols_axis("xy", col, col + 1)
+
+        pair_cols.append((col, col + 1))
+        col += 2
+
+    return col, pair_cols
+
+
+def run_mh(ip_mh_data, op_mh_data):
+    bc_segments = split_mh(ip_mh_data["T"], ip_mh_data["H"], ip_mh_data["M"])
+    ef_segments = split_mh(op_mh_data["T"], op_mh_data["H"], op_mh_data["M"])
+
+    old = op.find_sheet("w", "MHipop")
+    if old:
+        old.destroy()
+
+    mh = op.new_sheet("w", lname="MHipop")
+
+    next_col, bc_pairs = write_mh_segments(mh, bc_segments, 0, "ip")
+    next_col += 1
+    _, ef_pairs = write_mh_segments(mh, ef_segments, next_col, "op")
+
+    plot_pairs("mhip", mh, bc_pairs)
+    plot_pairs("mhop", mh, ef_pairs)
+
+    for i, (bc_pair, ef_pair) in enumerate(zip(bc_pairs, ef_pairs), start=1):
+        plot_pairs(f"mh{i}", mh, [bc_pair, ef_pair])
+
+    return len(bc_segments), len(ef_segments)
+
+
+def main(use_cli=True, close_origin=True):
+    if use_cli:
+        args = parse_args()
+        if args.project_path:
+            globals()["project_path"] = args.project_path
+        if args.source_sheet:
+            globals()["source_sheet"] = args.source_sheet
+
+    op.set_show(True)
+    op.open(project_path)
+
+    wks = op.find_sheet("w", source_sheet)
+    if wks is None:
+        raise Exception(f"项目里找不到名为 {source_sheet} 的工作表。请确认原始数据表名称是 {source_sheet}。")
+
+    df = prepare_source_data(wks.to_df())
+    if df.shape[1] < 6:
+        raise Exception("原始数据表列数不够。请确认 ipop 表至少有 A-F 六列数据。")
+
+    ip_mt_data, ip_mh_data = split_mt_mh_rows(df.iloc[:, 0], df.iloc[:, 1], df.iloc[:, 2])
+    op_mt_data, op_mh_data = split_mt_mh_rows(df.iloc[:, 3], df.iloc[:, 4], df.iloc[:, 5])
+
+    run_mt(ip_mt_data, op_mt_data)
+    bc_count, ef_count = run_mh(ip_mh_data, op_mh_data)
+
+    save_project(close_origin=close_origin)
+
+    print("完成")
+    print("已生成 MT 和 MHipop")
+    print(f"BC MH 段数: {bc_count}")
+    print(f"EF MH 段数: {ef_count}")
+
+
+if __name__ == "__main__":
+    main()

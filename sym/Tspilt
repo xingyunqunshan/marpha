@@ -1,0 +1,722 @@
+import argparse
+from pathlib import Path
+
+import originpro as op
+import pandas as pd
+
+
+project_path = ""
+source_sheet = "ipop"
+sym_sheet = "sym"
+sym_chazhi_sheet = "sym-chazhi"
+sym_book_name = "sym"
+sym_chazhi_book_name = "symchazhi"
+temp_break = 10.0
+max_field = 30000.0
+pair_tolerance = 200.0
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--project", dest="project_path", required=True)
+    parser.add_argument("--source-sheet", default=source_sheet)
+    parser.add_argument("--max-field", type=float, default=max_field)
+    parser.add_argument("--pair-tolerance", type=float, default=pair_tolerance)
+    parser.add_argument("--interpolate", action="store_true")
+    parser.add_argument("--fix-pairs", action="store_true")
+    parser.add_argument("--hall-sym", action="store_true")
+    parser.add_argument("--mr-normalize", action="store_true")
+    parser.add_argument("--reverse-hall", action="store_true")
+    return parser.parse_args()
+
+
+def iter_workbooks():
+    index = 0
+    while True:
+        book = op.find_book("w", index)
+        if book is None:
+            break
+        yield book
+        index += 1
+
+
+def find_sheet_by_book_name(short_name, long_name=None):
+    for ref in (short_name, long_name):
+        if ref:
+            wks = op.find_sheet("w", ref)
+            if wks is not None:
+                return wks
+
+    for book in iter_workbooks():
+        names = {book.name}
+        if book.lname:
+            names.add(book.lname)
+        if short_name in names or (long_name and long_name in names):
+            return book[0]
+
+    return None
+
+
+def project_sheet_names():
+    names = []
+    for book in iter_workbooks():
+        label = book.name
+        if book.lname and book.lname != book.name:
+            label = f"{book.name} ({book.lname})"
+        names.append(label)
+    return names
+
+
+def output_sheet_names():
+    prefix = source_sheet.strip()
+    return {
+        "sym_sheet": f"{prefix}sym",
+        "sym_book": f"{prefix}sym",
+        "sym_chazhi_sheet": f"{prefix}sym-chazhi",
+        "sym_chazhi_book": f"{prefix}symchazhi",
+    }
+
+
+def get_or_raise_sheet(name, short_name=None):
+    wks = find_sheet_by_book_name(short_name or name, name)
+    if wks is None:
+        available = ", ".join(project_sheet_names()) or "none"
+        raise Exception(f"Sheet not found: {name}. Available workbooks: {available}")
+    return wks
+
+
+def recreate_sheet(name, short_name):
+    old = find_sheet_by_book_name(short_name, name)
+    if old:
+        old.get_book().destroy()
+    wks = op.new_sheet("w", lname=name)
+    wks.get_book().name = short_name
+    wks.get_book().lname = name
+    return wks
+
+
+def get_processing_sheet(use_interpolated):
+    names = output_sheet_names()
+    if use_interpolated:
+        return get_or_raise_sheet(names["sym_chazhi_sheet"], names["sym_chazhi_book"])
+    return get_or_raise_sheet(names["sym_sheet"], names["sym_book"])
+
+
+def numeric_value(value):
+    try:
+        if value is None or value == "":
+            return None
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(number):
+        return None
+    return number
+
+
+def to_numeric_frame(wks):
+    df = wks.to_df()
+    if df.shape[1] < 3:
+        raise Exception(f"{source_sheet} needs at least 3 columns: temperature, field, resistance.")
+
+    data = pd.DataFrame(
+        {
+            "T": pd.to_numeric(df.iloc[:, 0], errors="coerce"),
+            "H": pd.to_numeric(df.iloc[:, 1], errors="coerce"),
+            "R": pd.to_numeric(df.iloc[:, 2], errors="coerce"),
+        }
+    ).dropna(subset=["T", "H", "R"])
+
+    if data.empty:
+        raise Exception(f"{source_sheet} has no numeric data in the first 3 columns.")
+
+    return data.reset_index(drop=True)
+
+
+def split_by_temperature(data):
+    segments = []
+    start = 0
+    temps = data["T"].to_list()
+
+    for i in range(1, len(data)):
+        if abs(temps[i] - temps[i - 1]) > temp_break:
+            segments.append(data.iloc[start:i].reset_index(drop=True))
+            start = i
+
+    segments.append(data.iloc[start:].reset_index(drop=True))
+    return [segment for segment in segments if not segment.empty]
+
+
+def set_group_labels(wks, base_col):
+    for col, label, unit in (
+        (base_col, "T", "K"),
+        (base_col + 1, "H", "Oe"),
+        (base_col + 2, "R", ""),
+        (base_col + 3, "H_rev", "Oe"),
+        (base_col + 4, "R_rev", ""),
+        (base_col + 5, "R", "Ω"),
+        (base_col + 6, "MR", ""),
+    ):
+        wks.set_label(col, label, "L")
+        if unit:
+            wks.set_label(col, unit, "U")
+
+    # Comment the sym (R) and MR columns with rounded temperature (e.g. "300K")
+    t_comment = ""
+    for v in wks.to_list(base_col):
+        nv = numeric_value(v)
+        if nv is not None:
+            t_comment = f"{round(nv)}K"
+            break
+
+    if t_comment:
+        wks.set_label(base_col + 5, t_comment, "C")
+        wks.set_label(base_col + 6, t_comment, "C")
+
+
+def write_base_segments(wks, segments):
+    for index, segment in enumerate(segments):
+        base_col = index * 7
+        wks._check_add_cols(base_col + 7)
+        wks.from_list(base_col, segment["T"].tolist())
+        wks.from_list(base_col + 1, segment["H"].tolist())
+        wks.from_list(base_col + 2, segment["R"].tolist())
+        set_group_labels(wks, base_col)
+
+
+def interpolate_segment(segment):
+    rows = []
+
+    for i in range(len(segment)):
+        rows.append(segment.iloc[i].to_dict())
+        if i >= len(segment) - 1:
+            continue
+
+        current_row = segment.iloc[i]
+        next_row = segment.iloc[i + 1]
+        if pd.notna(current_row["H"]) and pd.notna(next_row["H"]):
+            rows.append(
+                {
+                    "T": None,
+                    "H": (float(current_row["H"]) + float(next_row["H"])) / 2,
+                    "R": (float(current_row["R"]) + float(next_row["R"])) / 2,
+                }
+            )
+
+    return pd.DataFrame(rows, columns=["T", "H", "R"])
+
+
+def rotate_from_negative_max_field(segment, target_field):
+    numeric_h = pd.to_numeric(segment["H"], errors="coerce")
+    first_values = numeric_h.dropna()
+    if first_values.empty:
+        return pd.DataFrame(columns=["H", "R"])
+
+    target_start = -float(first_values.iloc[0])
+    hits = (numeric_h - target_start).abs().dropna()
+    if hits.empty:
+        return pd.DataFrame(columns=["H", "R"])
+
+    i0 = int(hits.idxmin())
+    active_hits = hits
+    if abs(float(segment.loc[i0, "H"]) - target_start) >= 1:
+        fallback_hits = (numeric_h + target_field).abs().dropna()
+        if fallback_hits.empty:
+            return pd.DataFrame(columns=["H", "R"])
+        i0 = int(fallback_hits.idxmin())
+        active_hits = fallback_hits
+    if i0 == 0 and len(active_hits) > 1:
+        later_hits = active_hits[active_hits.index > 0]
+        if not later_hits.empty:
+            i0 = int(later_hits.idxmin())
+    if i0 == 0:
+        return pd.DataFrame(columns=["H", "R"])
+
+    return pd.concat(
+        [segment.loc[i0:, ["H", "R"]], segment.loc[: i0 - 1, ["H", "R"]]],
+        ignore_index=True,
+    )
+
+
+def write_chazhi_segments(wks, segments, target_field, interpolate):
+    processed = []
+
+    for index, segment in enumerate(segments):
+        if interpolate:
+            segment = interpolate_segment(segment)
+
+        base_col = index * 7
+        wks._check_add_cols(base_col + 7)
+
+        forward_t = segment["T"].tolist()
+        forward_h = segment["H"].tolist()
+        forward_r = segment["R"].tolist()
+
+        rotated = rotate_from_negative_max_field(segment, target_field)
+        if not rotated.empty:
+            reverse_h = rotated["H"].tolist()
+            reverse_r = rotated["R"].tolist()
+        else:
+            reverse_h = []
+            reverse_r = []
+
+        # Pad all five columns to the same length so AB / CD never mismatch
+        max_len = max(
+            len(forward_t), len(forward_h), len(forward_r),
+            len(reverse_h), len(reverse_r),
+        )
+        forward_t += [""] * (max_len - len(forward_t))
+        forward_h += [""] * (max_len - len(forward_h))
+        forward_r += [""] * (max_len - len(forward_r))
+        reverse_h += [""] * (max_len - len(reverse_h))
+        reverse_r += [""] * (max_len - len(reverse_r))
+
+        wks.from_list(base_col, forward_t)
+        wks.from_list(base_col + 1, forward_h)
+        wks.from_list(base_col + 2, forward_r)
+        wks.from_list(base_col + 3, reverse_h)
+        wks.from_list(base_col + 4, reverse_r)
+
+        set_group_labels(wks, base_col)
+        processed.append((len(segment), len(rotated)))
+
+    return processed
+
+
+def trim_pair_columns(x_values, y_values):
+    size = max(len(x_values), len(y_values))
+    x_values = list(x_values) + [""] * (size - len(x_values))
+    y_values = list(y_values) + [""] * (size - len(y_values))
+
+    while x_values and numeric_value(x_values[-1]) is None and numeric_value(y_values[-1]) is None:
+        x_values.pop()
+        y_values.pop()
+
+    return x_values, y_values
+
+
+def clear_and_write_column(wks, col, values, clear_rows):
+    wks.from_list(col, [""] * clear_rows)
+    if values:
+        wks.from_list(col, values)
+
+
+def trim_values(values):
+    values = list(values)
+    while values and numeric_value(values[-1]) is None:
+        values.pop()
+    return values
+
+
+def iter_chazhi_groups(wks):
+    _, col_count = wks.shape
+    for base_col in range(0, col_count, 7):
+        if base_col + 6 < col_count:
+            yield base_col
+
+
+def destroy_graph(name):
+    graph = op.find_graph(name)
+    if graph:
+        graph.destroy()
+
+
+def format_graph_layer(gl):
+    gl.lt_exec(
+        "layer.x.showAxes=3;"
+        "layer.y.showAxes=3;"
+        "layer.x2.showAxes=3;"
+        "layer.y2.showAxes=3;"
+        "layer.x.ticks=1;"
+        "layer.y.ticks=1;"
+        "layer.x2.ticks=1;"
+        "layer.y2.ticks=1;"
+        "layer.x.thickness=3;"
+        "layer.y.thickness=3;"
+        "layer.x2.thickness=3;"
+        "layer.y2.thickness=3;"
+        "layer.frame.width=3;"
+    )
+
+
+def plot_hall_symmetry(wks, use_interpolated):
+    graph_name = "HallSym_chazhi" if use_interpolated else "HallSym"
+    destroy_graph(graph_name)
+    gp = op.new_graph(lname=graph_name, template="Scatter")
+    gl = gp[0]
+    plots = []
+
+    for base_col in iter_chazhi_groups(wks):
+        x_values = trim_values(wks.to_list(base_col + 1))
+        y_values = trim_values(wks.to_list(base_col + 5))
+        if len(x_values) >= 2 and len(y_values) >= 2:
+            plots.append(gl.add_plot(wks, coly=base_col + 5, colx=base_col + 1))
+
+    for plot in plots:
+        plot.lt = 200
+    if len(plots) > 1:
+        gl.group()
+    if plots:
+        gl.rescale()
+        format_graph_layer(gl)
+
+    return len(plots)
+
+
+def write_hall_symmetry(use_interpolated):
+    wks = get_processing_sheet(use_interpolated)
+    group_count = 0
+
+    for base_col in iter_chazhi_groups(wks):
+        forward_r = trim_values(wks.to_list(base_col + 2))
+        reverse_r = trim_values(wks.to_list(base_col + 4))
+        row_count = min(len(forward_r), len(reverse_r))
+        output = []
+
+        for row in range(row_count):
+            c_value = numeric_value(forward_r[row])
+            e_value = numeric_value(reverse_r[row])
+            output.append("" if c_value is None or e_value is None else c_value / 2 - e_value / 2)
+
+        clear_rows = max(len(forward_r), len(reverse_r), len(wks.to_list(base_col + 5)), 1)
+        clear_and_write_column(wks, base_col + 5, output, clear_rows)
+        group_count += 1
+
+    plot_count = plot_hall_symmetry(wks, use_interpolated)
+    return group_count, plot_count
+
+
+def reverse_hall_sign(use_interpolated):
+    wks = get_processing_sheet(use_interpolated)
+    group_count = 0
+
+    for base_col in iter_chazhi_groups(wks):
+        values = trim_values(wks.to_list(base_col + 5))
+        output = []
+        for value in values:
+            number = numeric_value(value)
+            output.append(value if number is None else -number)
+
+        clear_rows = max(len(values), len(wks.to_list(base_col + 5)), 1)
+        clear_and_write_column(wks, base_col + 5, output, clear_rows)
+        group_count += 1
+
+    return group_count
+
+
+def plot_mr_normalize(wks, use_interpolated):
+    graph_name = "MRSym_chazhi" if use_interpolated else "MRSym"
+    destroy_graph(graph_name)
+    gp = op.new_graph(lname=graph_name, template="Scatter")
+    gl = gp[0]
+    plots = []
+
+    for base_col in iter_chazhi_groups(wks):
+        x_values = trim_values(wks.to_list(base_col + 1))
+        y_values = trim_values(wks.to_list(base_col + 6))
+        if len(x_values) >= 2 and len(y_values) >= 2:
+            plots.append(gl.add_plot(wks, coly=base_col + 6, colx=base_col + 1))
+
+    for plot in plots:
+        plot.lt = 200
+    if len(plots) > 1:
+        gl.group()
+    if plots:
+        gl.rescale()
+        format_graph_layer(gl)
+
+    return len(plots)
+
+
+def write_mr_normalize(use_interpolated):
+    wks = get_processing_sheet(use_interpolated)
+    fill_count = 0
+    normalize_count = 0
+    skipped_count = 0
+
+    for base_col in iter_chazhi_groups(wks):
+        forward_r = trim_values(wks.to_list(base_col + 2))
+        reverse_r = trim_values(wks.to_list(base_col + 4))
+        sym_row_count = min(len(forward_r), len(reverse_r))
+        sym_output = []
+
+        for row in range(sym_row_count):
+            c_value = numeric_value(forward_r[row])
+            e_value = numeric_value(reverse_r[row])
+            sym_output.append("" if c_value is None or e_value is None else c_value / 2 + e_value / 2)
+
+        clear_sym_rows = max(len(forward_r), len(reverse_r), len(wks.to_list(base_col + 5)), 1)
+        clear_and_write_column(wks, base_col + 5, sym_output, clear_sym_rows)
+        fill_count += 1
+
+        field_values = trim_values(wks.to_list(base_col + 1))
+        sym_values = trim_values(sym_output)
+        row_count = min(len(field_values), len(sym_values))
+
+        best_row = None
+        best_abs = None
+        for row in range(row_count):
+            field = numeric_value(field_values[row])
+            if field is None:
+                continue
+            abs_field = abs(field)
+            if best_abs is None or abs_field < best_abs:
+                best_abs = abs_field
+                best_row = row
+
+        if best_row is None:
+            skipped_count += 1
+            continue
+
+        f0 = numeric_value(sym_values[best_row])
+        if f0 is None or f0 == 0:
+            skipped_count += 1
+            continue
+
+        output = []
+        for row in range(row_count):
+            value = numeric_value(sym_values[row])
+            output.append("" if value is None else (value - f0) / f0)
+
+        clear_rows = max(len(sym_values), len(wks.to_list(base_col + 6)), 1)
+        clear_and_write_column(wks, base_col + 6, output, clear_rows)
+        normalize_count += 1
+
+    plot_count = plot_mr_normalize(wks, use_interpolated)
+    return fill_count, normalize_count, skipped_count, plot_count
+
+
+def mark_yellow(wks, row, col):
+    # Best effort. Origin formatting commands vary by version; data processing
+    # should continue even if coloring is not accepted by the local Origin.
+    for command in (
+        f"wks.col{col + 1}[{row + 1}].color=2;",
+        f"wks.col{col + 1}[{row + 1}].fillcolor=2;",
+        f"wks.col{col + 1}[{row + 1}].color=color(Yellow);",
+    ):
+        try:
+            wks.lt_exec(command)
+            return
+        except Exception:
+            pass
+
+
+def fix_one_pair(forward_h, forward_r, reverse_h, reverse_r):
+    forward_h, forward_r = trim_pair_columns(forward_h, forward_r)
+    reverse_h, reverse_r = trim_pair_columns(reverse_h, reverse_r)
+
+    i = 0
+    j = 0
+    delete_streak = 0
+    interrupted = False
+    mark_i = None
+    mark_j = None
+
+    while i <= len(forward_h) - 2 and j <= len(reverse_h) - 2:
+        b_value = numeric_value(forward_h[i])
+        d_value = numeric_value(reverse_h[j])
+
+        if b_value is None:
+            i += 1
+            continue
+        if d_value is None:
+            j += 1
+            continue
+
+        if abs(b_value + d_value) < pair_tolerance:
+            i += 1
+            j += 1
+            delete_streak = 0
+            continue
+
+        next_b = numeric_value(forward_h[i + 1])
+        next_d = numeric_value(reverse_h[j + 1])
+        err_del_forward = float("inf") if next_b is None else abs(next_b + d_value)
+        err_del_reverse = float("inf") if next_d is None else abs(b_value + next_d)
+
+        if err_del_forward <= err_del_reverse:
+            del forward_h[i]
+            del forward_r[i]
+        else:
+            del reverse_h[j]
+            del reverse_r[j]
+
+        delete_streak += 1
+        if delete_streak >= 4:
+            interrupted = True
+            mark_i = min(i, max(len(forward_h) - 1, 0))
+            mark_j = min(j, max(len(reverse_h) - 1, 0))
+            break
+
+    return {
+        "forward_h": forward_h,
+        "forward_r": forward_r,
+        "reverse_h": reverse_h,
+        "reverse_r": reverse_r,
+        "interrupted": interrupted,
+        "mark_i": mark_i,
+        "mark_j": mark_j,
+    }
+
+
+def fix_sym_chazhi_pairs(use_interpolated):
+    wks = get_processing_sheet(use_interpolated)
+    _, col_count = wks.shape
+    break_count = 0
+    break_groups = []
+    group_count = 0
+
+    for start_col in range(1, col_count, 7):
+        if start_col + 3 >= col_count:
+            continue
+
+        group_count += 1
+        forward_h = wks.to_list(start_col)
+        forward_r = wks.to_list(start_col + 1)
+        reverse_h = wks.to_list(start_col + 2)
+        reverse_r = wks.to_list(start_col + 3)
+
+        fixed = fix_one_pair(forward_h, forward_r, reverse_h, reverse_r)
+        fw_h = fixed["forward_h"]
+        fw_r = fixed["forward_r"]
+        rv_h = fixed["reverse_h"]
+        rv_r = fixed["reverse_r"]
+
+        # Pad to consistent length so AB / CD columns never drift apart
+        pair_len = max(len(fw_h), len(fw_r), len(rv_h), len(rv_r), 1)
+        fw_h += [""] * (pair_len - len(fw_h))
+        fw_r += [""] * (pair_len - len(fw_r))
+        rv_h += [""] * (pair_len - len(rv_h))
+        rv_r += [""] * (pair_len - len(rv_r))
+
+        clear_and_write_column(wks, start_col, fw_h, pair_len)
+        clear_and_write_column(wks, start_col + 1, fw_r, pair_len)
+        clear_and_write_column(wks, start_col + 2, rv_h, pair_len)
+        clear_and_write_column(wks, start_col + 3, rv_r, pair_len)
+
+        if fixed["interrupted"]:
+            break_count += 1
+            break_groups.append(group_count)
+            if fixed["mark_i"] is not None:
+                mark_yellow(wks, fixed["mark_i"], start_col)
+            if fixed["mark_j"] is not None:
+                mark_yellow(wks, fixed["mark_j"], start_col + 2)
+
+    return group_count, break_count, break_groups
+
+
+def save_project(close_origin=True):
+    op.lt_exec("system.project.backup=0;system.project.autosaveon=0;")
+    save_path = str(Path(project_path))
+    saved = op.save(save_path)
+    if not saved:
+        lt_path = save_path.replace("\\", "/").replace('"', '\\"')
+        try:
+            op.lt_exec(f'save -i "{lt_path}";')
+            saved = True
+        except Exception:
+            saved = False
+
+    if not saved:
+        raise Exception(f"Project save-as overwrite failed: {save_path}")
+
+    if close_origin:
+        op.exit()
+
+
+def run_generate(interpolate):
+    src = get_or_raise_sheet(source_sheet)
+    data = to_numeric_frame(src)
+    segments = split_by_temperature(data)
+    if not segments:
+        raise Exception("No valid temperature segments were found.")
+
+    names = output_sheet_names()
+    sym = recreate_sheet(names["sym_sheet"], names["sym_book"])
+    if interpolate:
+        write_base_segments(sym, segments)
+    else:
+        write_chazhi_segments(sym, segments, max_field, False)
+
+    if interpolate:
+        sym_chazhi = recreate_sheet(names["sym_chazhi_sheet"], names["sym_chazhi_book"])
+        processed = write_chazhi_segments(sym_chazhi, segments, max_field, True)
+    else:
+        processed = [(len(segment), len(rotate_from_negative_max_field(segment, max_field))) for segment in segments]
+    return segments, processed, names
+
+
+def main(use_cli=True, close_origin=True):
+    global project_path, source_sheet, max_field, pair_tolerance
+
+    if use_cli:
+        args = parse_args()
+        project_path = args.project_path
+        source_sheet = args.source_sheet
+        max_field = args.max_field
+        pair_tolerance = args.pair_tolerance
+        interpolate = args.interpolate
+        fix_pairs = args.fix_pairs
+        hall_sym = args.hall_sym
+        mr_normalize = args.mr_normalize
+        reverse_hall = args.reverse_hall
+    else:
+        interpolate = False
+        fix_pairs = False
+        hall_sym = False
+        mr_normalize = False
+        reverse_hall = False
+
+    op.set_show(True)
+    op.open(project_path)
+
+    if fix_pairs:
+        group_count, break_count, break_groups = fix_sym_chazhi_pairs(interpolate)
+        save_project(close_origin=close_origin)
+        print("Done")
+        print(f"Groups processed: {group_count}")
+        print(f"Interrupted groups: {break_count}")
+        if break_groups:
+            print(f"Interrupted group indexes: {','.join(str(group) for group in break_groups)}")
+        print(f"Pair tolerance: {pair_tolerance}")
+        return
+
+    if hall_sym:
+        group_count, plot_count = write_hall_symmetry(interpolate)
+        save_project(close_origin=close_origin)
+        print("Done")
+        print(f"Hall symmetry groups: {group_count}")
+        print(f"Hall plots: {plot_count}")
+        return
+
+    if mr_normalize:
+        fill_count, normalize_count, skipped_count, plot_count = write_mr_normalize(interpolate)
+        save_project(close_origin=close_origin)
+        print("Done")
+        print(f"MR F-filled groups: {fill_count}")
+        print(f"MR normalized groups: {normalize_count}")
+        print(f"MR skipped groups: {skipped_count}")
+        print(f"MR plots: {plot_count}")
+        return
+
+    if reverse_hall:
+        group_count = reverse_hall_sign(interpolate)
+        save_project(close_origin=close_origin)
+        print("Done")
+        print(f"Hall sign reversed groups: {group_count}")
+        return
+
+    segments, processed, names = run_generate(interpolate)
+    save_project(close_origin=close_origin)
+
+    print("Done")
+    print(f"Generated sheets: {names['sym_sheet']}, {names['sym_chazhi_sheet']}")
+    print(f"Temperature segments: {len(segments)}")
+    print(f"Interpolate: {'on' if interpolate else 'off'}")
+    print(f"Max field: {max_field}")
+    for index, (src_rows, rev_rows) in enumerate(processed, start=1):
+        print(f"Group {index}: forward {src_rows} rows, reverse {rev_rows} rows")
+
+
+if __name__ == "__main__":
+    main()
